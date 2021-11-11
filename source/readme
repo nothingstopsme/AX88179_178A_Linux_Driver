@@ -51,6 +51,9 @@ Getting Start
 
 	[root@localhost template]# make install
 
+	 Make sure you have the privileges needed to conduct the installation
+	 (might need to use "sudo make install" if you are not root user).
+
 
 ================
 Usage

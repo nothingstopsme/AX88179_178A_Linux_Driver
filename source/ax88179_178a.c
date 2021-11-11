@@ -553,8 +553,11 @@ static int ax88179_resume(struct usb_interface *intf)
 	/* Configure RX control register => start operation */
 	tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START | AX_RX_CTL_AP |
 		 AX_RX_CTL_AMALL | AX_RX_CTL_AB;
-	if (NET_IP_ALIGN == 0)
+
+	// Using hardward alignment when NET_IP_ALIGN == 2
+	if (NET_IP_ALIGN == 2)
 		tmp16 |= AX_RX_CTL_IPE;
+	
 	ax88179_write_cmd_nopm(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, &tmp16);
 
 	return usbnet_resume(intf);
@@ -845,7 +848,9 @@ static void ax88179_set_multicast(struct net_device *net)
 #endif
 
 	data->rxctl = (AX_RX_CTL_START | AX_RX_CTL_AB);
-	if (NET_IP_ALIGN == 0)
+	
+	// Using hardward alignment when NET_IP_ALIGN == 2
+	if (NET_IP_ALIGN == 2)
 		data->rxctl |= AX_RX_CTL_IPE;
 
 	if (net->flags & IFF_PROMISC) {
@@ -1670,8 +1675,11 @@ static int ax88179_bind(struct usbnet *dev, struct usb_interface *intf)
 	/* Configure RX control register => start operation */
 	tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START | AX_RX_CTL_AP |
 		 AX_RX_CTL_AMALL | AX_RX_CTL_AB;
-	if (NET_IP_ALIGN == 0)
+	
+	// Using hardward alignment when NET_IP_ALIGN == 2
+	if (NET_IP_ALIGN == 2)
 		tmp16 |= AX_RX_CTL_IPE;
+	
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, &tmp16);
 
 	tmp = AX_MONITOR_MODE_PMETYPE | AX_MONITOR_MODE_PMEPOL |
@@ -1773,13 +1781,21 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	u16 hdr_off = 0;
 	u32 *pkt_hdr = NULL;
 
+
+	u8 *pkt_payload = NULL;
+	bool need_returning = false;
+	int last_status = 0;
+	u32 skip = 0, headroom = 0;
+	u8 extra_len = 0, data_offset = 0;
+
 	if (skb->len == 0) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
 		netdev_err(dev->net, "RX SKB length zero");
 #else
 		deverr(dev, "RX SKB length zero");
 #endif
-		dev->net->stats.rx_errors++;
+		// letting usbnet to increment the rx_error and handle this skb which contains no packets
+		//dev->net->stats.rx_errors++;
 		return 0;
 	}
 
@@ -1793,7 +1809,10 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 
 	pkt_cnt = (u16)rx_hdr;
 	hdr_off = (u16)(rx_hdr >> 16);
+	pkt_payload = (u8 *)skb->data;
 	pkt_hdr = (u32 *)(skb->data + hdr_off);
+
+	skb->ip_summed = CHECKSUM_NONE;
 
 
 	while (pkt_cnt--) {
@@ -1802,71 +1821,100 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		le32_to_cpus(pkt_hdr);
 		pkt_len = (*pkt_hdr >> 16) & 0x1fff;
 
-		/* Check CRC or runt packet */
-		if ((*pkt_hdr & AX_RXHDR_CRC_ERR) ||
-		    (*pkt_hdr & AX_RXHDR_DROP_ERR)) {
-			skb_pull(skb, (pkt_len + 7) & 0xFFF8);
+		/* 
+		* It seems every input skb will include one zero-length packet with the flag AX_RXHDR_DROP_ERR on as the last one in its contained packet sequence, 
+		* so skipping it like the original logic did 
+		*/
+		if ((*pkt_hdr & AX_RXHDR_DROP_ERR)) {
+			skip += (pkt_len + 7) & 0xFFF8;
 			pkt_hdr++;
+
 			continue;
 		}
 
-		if (pkt_cnt == 0) {			
-			skb->len = pkt_len;
+		/* The next packet is about to be handled. 
+		*	Before having the input skb linked to the next packet, 
+		*	creating a new skb for the current one (if exists, as indicated by need_returning), returning it via usbnet_skb_return(), 
+		* and/or reporting the corresponding status if there is something wrong.
+		*/
+		if(need_returning)
+		{
+			if(!last_status)
+				dev->net->stats.rx_errors++;
+			else
+			{
+				ax_skb = skb_clone(skb, GFP_ATOMIC);
 
-			/* Skip IP alignment psudo header */
-			if (NET_IP_ALIGN == 0)
-				skb_pull(skb, 2);
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
-			skb->tail = skb->data + skb->len;
-#else
-			skb_set_tail_pointer(skb, skb->len);
-#endif
-			skb->truesize = skb->len + sizeof(struct sk_buff);
-			ax88179_rx_checksum(skb, pkt_hdr);
-
-			return 1;
+				if (ax_skb) {
+					usbnet_skb_return(dev, ax_skb);					
+				}
+				else
+				{
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
+					netdev_err(dev->net, "Dropping the current packet due to the failure to create its skb clone.");
+	#else
+					deverr(dev, "Dropping the current packet due to the failure to create its skb clone.");
+	#endif
+					dev->net->stats.rx_dropped++;
+				}
+			}
+			need_returning = false;
 		}
 
-#ifndef RX_SKB_COPY
-		ax_skb = skb_clone(skb, GFP_ATOMIC);
-#else
-		ax_skb = alloc_skb(pkt_len + NET_IP_ALIGN, GFP_ATOMIC);
-		skb_reserve(ax_skb, NET_IP_ALIGN);
-#endif
+		// Updating the information in the input skb, so that it refers to the next packet
 
-		if (ax_skb) {
-#ifndef RX_SKB_COPY
-			ax_skb->len = pkt_len;
-	
-			/* Skip IP alignment psudo header */
-			if (NET_IP_ALIGN == 0)
-				skb_pull(ax_skb, 2);
+		last_status = (*pkt_hdr & AX_RXHDR_CRC_ERR) ? 0 : 1;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
-			ax_skb->tail = ax_skb->data + ax_skb->len;
-#else
-			skb_set_tail_pointer(ax_skb, ax_skb->len);
-#endif
-
-#else
-			skb_put(ax_skb, pkt_len);
-			memcpy(ax_skb->data, skb->data, pkt_len);
-
-			if (NET_IP_ALIGN == 0)
-				skb_pull(ax_skb, 2);
-#endif
-			ax_skb->truesize = ax_skb->len + sizeof(struct sk_buff);
-			ax88179_rx_checksum(ax_skb, pkt_hdr);
-			usbnet_skb_return(dev, ax_skb);
-		} else {
-			return 0;
+		/* 
+			Skip IP alignment psudo header.
+		*/
+		extra_len = 0;
+		data_offset = 0;
+		// For the case NET_IP_ALIGN == 2, the hardware has done it for us
+		if (NET_IP_ALIGN != 0 && NET_IP_ALIGN != 2)
+		{
+			extra_len = NET_IP_ALIGN;
+			data_offset = NET_IP_ALIGN;
+			
+			headroom = skb_headroom(skb);
+			if(headroom < NET_IP_ALIGN)
+				last_status = !pskb_expand_head(skb, NET_IP_ALIGN - headroom, 0, GFP_ATOMIC)?1:0;
 		}
 
-		skb_pull(skb, (pkt_len + 7) & 0xFFF8);
+		skb->len = pkt_len + extra_len;				
+		skb->data = pkt_payload + skip - data_offset;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
+		skb->tail = skb->data + skb->len;
+#else
+		skb_set_tail_pointer(skb, skb->len);
+#endif
+
+		
+		skb->truesize = SKB_TRUESIZE(skb->len);
+		ax88179_rx_checksum(skb, pkt_hdr);
+
+		// advancing to the next packet along the packet sequence
+		skip += (pkt_len + 7) & 0xFFF8;
 		pkt_hdr++;
+
+		/* 
+		 * theer is a new packet referred to by the input skb now, which has yet to be returned;
+		 * so need_returning is set to trigger the necessary returning process
+		 */
+		need_returning = true;
+
 	}
-	return 1;
+
+
+	/*
+	* At this point, the input skb and last_status should point to the last packet with AX_RXHDR_DROP_ERR off in ints contained packet sequence (or remain unmodified if there are no such packets).
+	* usbnet will proceed to handle what is left after this function returns.
+	*
+	* This processing strategy will allow this mini-driver to extract multiple packets inside the input skb while keeping the packet statistics correctly reported (hopefully), 
+	* without using the flag FLAG_MULTI_PACKET
+	*
+	*/
+	return last_status;
 }
 
 static struct sk_buff *
@@ -1899,7 +1947,10 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 	headroom = skb_headroom(skb);
 	tailroom = skb_tailroom(skb);
 
-	if ((headroom + tailroom) >= 8) {
+	/*
+	* adding extra checks (skb_cloned(), skb_is_nonlinear()) to make sure the manipulatiton of the skb buffer with memmove() is safe
+	*/
+	if (!skb_cloned(skb) && !skb_is_nonlinear(skb) && (headroom + tailroom) >= 8) {
 		if (headroom < 8) {
 			skb->data = memmove(skb->head + 8, skb->data, skb->len);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
@@ -2158,8 +2209,11 @@ static int ax88179_reset(struct usbnet *dev)
 	/* Configure RX control register => start operation */
 	*tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START | AX_RX_CTL_AP |
 		 AX_RX_CTL_AMALL | AX_RX_CTL_AB;
-	if (NET_IP_ALIGN == 0)
+	
+	// Using hardward alignment when NET_IP_ALIGN == 2
+	if (NET_IP_ALIGN == 2)
 		*tmp16 |= AX_RX_CTL_IPE;
+	
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, tmp16);
 
 	*tmp = AX_MONITOR_MODE_PMETYPE | AX_MONITOR_MODE_PMEPOL |

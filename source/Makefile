@@ -33,7 +33,7 @@ $(TARGET).o: $(OBJS)
 	$(LD) $(LD_RFLAG) -r -o $@ $(OBJS)
 
 install:
-	su -c "cp -v $(TARGET).ko $(DEST) && /sbin/depmod -a"
+	cp -v $(TARGET).ko $(DEST) && /sbin/depmod -a
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

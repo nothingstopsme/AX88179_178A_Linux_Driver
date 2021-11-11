@@ -15,5 +15,5 @@ During my tests it has also been found that this hardware seems quite susceptibl
 
 suggests that for having a more stable device it would be better to remove potential sources of noise by:
 * Plugging it directly to a host socket, or
-* Using a quality extension cable and keeping it as short as possible if you really need it.
+* Using a quality extension cable (as short as possible) if you really need it.
 

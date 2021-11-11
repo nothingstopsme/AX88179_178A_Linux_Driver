@@ -13,7 +13,7 @@ During my tests it has also been found that this hardware seems quite susceptibl
 * the same host + the same extention cable + at high speed (usb 2.0) => worked
 * the same host + the same extention cable + at super speed + replacing the attached cable to the device with one of good shielding (Yes, I did resoldering) => worked
 
-suggests that for having a more stable device it would be better to remove potential sources of noise by:
+suggests that for having your device run more stably one might consider remove potential sources of noise by:
 * Plugging it directly to a host socket, or
 * Using a quality extension cable (as short as possible) if you really need it.
 

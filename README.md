@@ -9,11 +9,11 @@ I am not an expert in electronic engineering or linux driver development, and al
 2. Updating the condition for the use of the feature of "hardware IP alignment", so that the driver can actually benefit from that hardware acceleration if the required alignment happens to be supported by the device.
 
 ## Extra Tips
-During my tests it has also been found that this hardware seems quite susceptible to signal noise, especially when running at super speed mode (usb 3.0). For example, when an additional 1-metre-long usb extention cable (which had worked well with my previous network adaptor) was connected between my device and a host socket, a few second's to a few minute's worth of packet transmission at super speed would render this adaptor irresponsive (albeit the corresponding network interface was still reported by the ifconfig command). More evidence from the other two test results:
-* the same host + the same extention cable + at high speed (usb 2.0) => worked
-* the same host + the same extention cable + at super speed + replacing the attached cable to the device with one of good shielding (Yes, I did resoldering) => worked
+During my tests it has also been found that this hardware seems quite susceptible to signal noise, especially when running at super speed mode (usb 3.0). For example, when an additional 1-metre-long usb extention cable (which had worked well with my previous network adaptor) was connected between my device and a host socket, a few second's to a few minute's worth of packet transmission at super speed would cause malfunctions of it and no subsequent packets could be sent or received (albeit the corresponding network interface was still reported by the ifconfig command); on the other hand, this device could survive the following two loading tests:
+* the same host + the same extention cable + at high speed (usb 2.0)
+* the same host + the same extention cable + at super speed + replacing the attached cable to the device with one of good shielding (Yes, I did resoldering)
 
-suggests that for having a more stable device it would be better to remove potential sources of noise by:
+In my view those results indicate that the noise in high frequency signal received by the device could easily damage its stability, and one might reduce this impact via:
 * Plugging it directly to a host socket, or
 * Using a quality extension cable (as short as possible) if you really need it.
 

@@ -92,6 +92,11 @@ ifg=xxx (0~255)
 	The maximum value for this parameters is 255.
 	The default value is -1 that will use the driver default setting (255 for USB3.0).
 
+rx_urb_size=xxx (0~255)
+	If greater than 0, directly designating the size (in KB) of each urb to be allocated for RX.
+	Note that any non-zero value of this parameter will override the default size, 
+	which is calculated based on the actual bsize used.
+
 bEEE=x	(0 or 1)
 	Enable/Disable the Ethernet EEE function.
 	0: Disable the EEE

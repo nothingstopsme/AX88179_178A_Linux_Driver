@@ -67,7 +67,7 @@ MODULE_PARM_DESC(ifg, "RX Bulk IN Inter Frame Gap");
 
 static unsigned char rx_urb_size = 0;
 module_param(rx_urb_size, byte, 0);
-MODULE_PARM_DESC(rx_urb_size, "The direct assignment of rx_urb_size of usbnet in KB (maximum 255)");
+MODULE_PARM_DESC(rx_urb_size, "If greater than 0, the size (in KB) of each urb to be allocated for RX");
 
 
 
@@ -1609,10 +1609,7 @@ static int ax88179_bind(struct usbnet *dev, struct usb_interface *intf)
 	memcpy(mac, &AX88179_BULKIN_SIZE[0], 5);
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_BULKIN_QCTRL, 5, 5, mac);
 
-	if(rx_urb_size > 0)
-		dev->rx_urb_size = 1024 * rx_urb_size;
-	else
-		dev->rx_urb_size = 1024 * 20;
+	dev->rx_urb_size = 1024 * 20;
 
 	tmp = 0x34;
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_PAUSE_WATERLVL_LOW, 1, 1, &tmp);
@@ -2079,16 +2076,16 @@ static int ax88179_link_reset(struct usbnet *dev)
 		*mode |= AX_MEDIUM_FULL_DUPLEX;	/* Bit 1 : FD */
 
 	if(rx_urb_size > 0)
-	{
 		dev->rx_urb_size = (1024 * rx_urb_size);
-		netdev_info(dev->net, "rx_urb_size has been designated to %u KB\n", rx_urb_size);
-	}
 	else
 		dev->rx_urb_size = (1024 * (tmp[3] + 2));
+	
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
+		netdev_info(dev->net, "rx_urb_size = %u KB, hard_mtu = %u\n", dev->rx_urb_size >> 10, dev->hard_mtu);
 		netdev_info(dev->net, "Write medium type: 0x%04x\n", *mode);
 #else
+		devinfo(dev, "rx_urb_size = %u KB, hard_mtu = %u\n", dev->rx_urb_size >> 10, dev->hard_mtu);
 		devinfo(dev, "Write medium type: 0x%04x\n", *mode);
 #endif
 	
@@ -2120,6 +2117,12 @@ static int ax88179_link_reset(struct usbnet *dev)
 				  2, 2, &data->rxctl);
 	}
 
+	/* 
+	making sure every qlen (especially rx_qlen) is update-to-date and then reinitialising rxq in usbnet, so that it has the correct size
+	*/
+	usbnet_update_max_qlen(dev);
+	usbnet_unlink_rx_urbs(dev);
+
 	*mode |= AX_MEDIUM_RECEIVE_EN;
 
 	/* Configure default medium type => giga */
@@ -2131,6 +2134,7 @@ static int ax88179_link_reset(struct usbnet *dev)
 		netif_carrier_on(dev->net);	
 #endif
 	kfree(tmp_16);
+
 
 	return 0;
 }
@@ -2189,10 +2193,7 @@ static int ax88179_reset(struct usbnet *dev)
 	memcpy(tmp, &AX88179_BULKIN_SIZE[0], 5);
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_BULKIN_QCTRL, 5, 5, tmp);
 
-	if(rx_urb_size > 0)
-		dev->rx_urb_size = 1024 * rx_urb_size;
-	else
-		dev->rx_urb_size = 1024 * 20;
+	dev->rx_urb_size = 1024 * 20;
 
 	tmp[0] = 0x34;
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_PAUSE_WATERLVL_LOW, 1, 1, tmp);
@@ -2273,7 +2274,7 @@ static int ax88179_reset(struct usbnet *dev)
 #else
 	devdbg(dev, "mtu %d\n", dev->net->mtu);
 #endif
-
+	
 	return 0;
 
 }

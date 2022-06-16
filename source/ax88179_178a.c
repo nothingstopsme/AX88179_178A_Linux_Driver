@@ -65,12 +65,6 @@ static int ifg = -1;
 module_param(ifg, int, 0);
 MODULE_PARM_DESC(ifg, "RX Bulk IN Inter Frame Gap");
 
-static unsigned char rx_urb_size = 0;
-module_param(rx_urb_size, byte, 0);
-MODULE_PARM_DESC(rx_urb_size, "If greater than 0, the size (in KB) of each urb to be allocated for RX");
-
-
-
 /* EEE advertisement is disabled in default setting */
 static int bEEE = 0;
 module_param(bEEE, int, 0);
@@ -1000,10 +994,16 @@ static int ax88179_set_mac_addr(struct net_device *net, void *p)
 {
 	struct usbnet *dev = netdev_priv(net);
 	struct sockaddr *addr = p;
-	int ret;
+	int ret;	
 
-	if (netif_running(net))
-		return -EBUSY;
+
+	/*
+	* By commenting out the netif_running() check below, it is allowed that live change of the mac address when this interface is up and running,
+	* which can happen in some networking configurations, such as link aggregation.
+	*/
+	//if (netif_running(net))
+	//	return -EBUSY;
+
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
@@ -1785,13 +1785,14 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	u32 rx_hdr = 0;
 	u16 hdr_off = 0;
 	u32 *pkt_hdr = NULL;
+	u16 pkt_len = 0;
 
 
 	u8 *pkt_payload = NULL;
 	bool need_returning = false;
 	int last_status = 0;
 	u32 skip = 0, headroom = 0;
-	u8 extra_len = 0, data_offset = 0;
+	u8 extra_header_len = 0;
 
 	if (skb->len == 0) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
@@ -1816,19 +1817,32 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	hdr_off = (u16)(rx_hdr >> 16);
 	pkt_payload = (u8 *)skb->data;
 	pkt_hdr = (u32 *)(skb->data + hdr_off);
+	
+	// For the case NET_IP_ALIGN == 2, the hardware has done it for us
+	if (NET_IP_ALIGN != 0 && NET_IP_ALIGN != 2)
+		extra_header_len = NET_IP_ALIGN;
+	else
+		extra_header_len = 0;
+
 
 	skb->ip_summed = CHECKSUM_NONE;
 
 
 	while (pkt_cnt--) {
-		u16 pkt_len;
 
+
+		
 		le32_to_cpus(pkt_hdr);
 		pkt_len = (*pkt_hdr >> 16) & 0x1fff;
 
+		
+
 		/* 
-		* It seems every input skb will include one zero-length packet with the flag AX_RXHDR_DROP_ERR on as the last one in its contained packet sequence, 
-		* so skipping it like the original logic did 
+		* It seems the packet sequence contained in an input skb is made up of alternate packets of actual data and "separators", each of which contain a zero-length frame with the flag AX_RXHDR_DROP_ERR on;
+		* therefore a packet sequence would look like:
+		* frame 0 | separator | frame 1 | separator | ... 
+		* 
+		* and those separators are skipped by ignoring any packets with flag AX_RXHDR_DROP_ERR on without reporting errors/drops, just as the original logic did
 		*/
 		if ((*pkt_hdr & AX_RXHDR_DROP_ERR)) {
 			skip += (pkt_len + 7) & 0xFFF8;
@@ -1838,9 +1852,10 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		}
 
 		/* The next packet is about to be handled. 
-		*	Before having the input skb linked to the next packet, 
-		*	creating a new skb for the current one (if exists, as indicated by need_returning), returning it via usbnet_skb_return(), 
-		* and/or reporting the corresponding status if there is something wrong.
+		*
+		*	But before having the input skb linked to the next packet, 
+		*	the current one (if located, as indicated by need_returning) needs to be copied and returned, 
+		* with the corresponding error status reported if there is something wrong.
 		*/
 		if(need_returning)
 		{
@@ -1848,18 +1863,27 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 				dev->net->stats.rx_errors++;
 			else
 			{
-				ax_skb = skb_clone(skb, GFP_ATOMIC);
+				/*
+					Doing (partial) packet copying instead of cloning to make sure each extracted packet has its own headroom, 
+					so that the manipulation of the headroom of one packet does not corrupt the data of those residing before it in the packet sequence
+				*/
+				//ax_skb = skb_clone(skb, GFP_ATOMIC);
+				ax_skb = __pskb_copy(skb, extra_header_len, GFP_ATOMIC);
 
 				if (ax_skb) {
+					//increasing the len of header by prepending it with extra bytes if required
+					if(extra_header_len > 0)
+						skb_push(ax_skb, extra_header_len);
+
 					usbnet_skb_return(dev, ax_skb);					
 				}
 				else
 				{
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
-					netdev_err(dev->net, "Dropping the current packet due to the failure to create its skb clone.");
-	#else
-					deverr(dev, "Dropping the current packet due to the failure to create its skb clone.");
-	#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
+					netdev_err(dev->net, "Failed to extract the current packet; dropping it.");
+#else
+					deverr(dev, "Failed to extract the current packet; dropping it");
+#endif
 					dev->net->stats.rx_dropped++;
 				}
 			}
@@ -1870,45 +1894,23 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 
 		last_status = (*pkt_hdr & AX_RXHDR_CRC_ERR) ? 0 : 1;
 
-		/* 
-			doing IP header alignment if required.
-		*/
-		extra_len = 0;
-		data_offset = 0;
-		// For the case NET_IP_ALIGN == 2, the hardware has done it for us
-		if (NET_IP_ALIGN != 0 && NET_IP_ALIGN != 2)
-		{
-			extra_len = NET_IP_ALIGN;
-			data_offset = NET_IP_ALIGN;
-			
-			headroom = skb_headroom(skb);
-			if(headroom < NET_IP_ALIGN)
-			{
-				last_status = !pskb_expand_head(skb, NET_IP_ALIGN - headroom, 0, GFP_ATOMIC)?1:0;
-				//updating pkt_payload in case there is reallocation by pskb_expand_head
-				if(last_status)
-					pkt_payload = skb->data - skip + data_offset;
-			}
-		}
-
-		skb->len = pkt_len + extra_len;				
-		skb->data = pkt_payload + skip - data_offset;
+		skb->len = pkt_len;	
+		skb->data = pkt_payload + skip;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
 		skb->tail = skb->data + skb->len;
 #else
 		skb_set_tail_pointer(skb, skb->len);
 #endif
-
 		
 		skb->truesize = SKB_TRUESIZE(skb->len);
 		ax88179_rx_checksum(skb, pkt_hdr);
 
-		// advancing to the next packet along the packet sequence
+		// Advancing to the next packet along the packet sequence
 		skip += (pkt_len + 7) & 0xFFF8;
 		pkt_hdr++;
 
 		/* 
-		 * theer is a new packet referred to by the input skb now, which has yet to be returned;
+		 * There is a new packet referred to by the input skb now, which has yet to be returned;
 		 * so need_returning is set to trigger the necessary returning process
 		 */
 		need_returning = true;
@@ -1916,16 +1918,33 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	}
 
 
+	if(last_status)
+	{
+		//Increasing the len of header of the last packet available for returning by prepending it with extra bytes if required
+		headroom = skb_headroom(skb);
+		if(headroom < extra_header_len)
+			last_status = !pskb_expand_head(skb, extra_header_len-headroom, 0, GFP_ATOMIC)?1:0;
+		
+		if(last_status && extra_header_len > 0)
+			skb_push(skb, extra_header_len);
+
+	}
+
 	/*
-	* At this point, the input skb and last_status should point to the last packet with AX_RXHDR_DROP_ERR off in ints contained packet sequence (or remain unmodified if there are no such packets).
-	* usbnet will proceed to handle what is left after this function returns.
+	* At this point, the input skb should point to the last packet in the packet sequence with AX_RXHDR_DROP_ERR off, with last_status indicating whether an error is detected while processing that packet;
+	* usbnet will proceed to process what is left after this function returns.
 	*
-	* This processing strategy will allow this mini-driver to extract multiple packets inside the input skb while keeping the packet statistics correctly reported (hopefully), 
-	* without using the flag FLAG_MULTI_PACKET
+	* By this strategy the mini-driver can extract multiple packets inside an input skb while keeping the packet statistics correctly reported (hopefully), 
+	* without resort to the flag FLAG_MULTI_PACKET
 	*
 	*/
+
+
 	return last_status;
 }
+
+
+
 
 static struct sk_buff *
 ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
@@ -1937,45 +1956,108 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 #else
 	int mss = 0;
 #endif
-	int headroom = 0;
-	int tailroom = 0;
+	int headroom = 0, headroom_required = 8, additional_headroom = 0;
+	int tailroom = 0, tailroom_required = 0, additional_tailroom = 0;
 
 	tx_hdr1 = skb->len;
 	tx_hdr2 = mss;
-	if (((skb->len + 8) % frame_size) == 0)
+	if (((skb->len + headroom_required) % frame_size) == 0)
+	{
+		netdev_dbg(dev->net, "tx payload length(%u) is divisible by frame_size(%d), tailroom = %d, skb_cloned(skb) = %d, skb_is_nonlinear(skb) = %d, skb_shinfo(skb)->nr_frags = %hhu", 
+								skb->len + 8, frame_size, skb_tailroom(skb), skb_cloned(skb), skb_is_nonlinear(skb), skb_shinfo(skb)->nr_frags);
 		tx_hdr2 |= 0x80008000;	/* Enable padding */
+		/* 
+		* In this case, as usbnet will pad one extra byte for us later, the actual length should be skb->len + 1
+		*/
+		tx_hdr1 += 1;
+
+
+		/*
+		* If nr_frags == 0, usbnet will expect there is a at least one-byte tail room and use it to send a padding frame to signal the end of usb frame transmission;
+		* therefore we have to make sure such a tail room is available
+		* 
+		*/
+		if(skb_shinfo(skb)->nr_frags == 0)
+			tailroom_required = 1;
+
+	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0)
 	if (!dev->can_dma_sg && (dev->net->features & NETIF_F_SG) &&
 	    skb_linearize(skb))
+	{
+		dev_kfree_skb_any(skb);
 		return NULL;
+	}
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24)
 	if ((dev->net->features & NETIF_F_SG) && skb_linearize(skb))
+	{
+		dev_kfree_skb_any(skb);
 		return NULL;
+	}
 #endif
 
 	headroom = skb_headroom(skb);
 	tailroom = skb_tailroom(skb);
 
+	additional_headroom = headroom < headroom_required ? headroom_required - headroom : 0;
+	additional_tailroom = tailroom < tailroom_required ? tailroom_required - tailroom : 0;
+
 	/*
-	* adding extra checks (skb_cloned(), skb_is_nonlinear()) to make sure the manipulatiton of the skb buffer with memmove() is safe
+	* Various checks and pskb_expand_head() below to make sure each skb has its own headroom and tailroom,
+	* so that the use of those rooms in one packet does not corrupt data in the others
 	*/
-	if (!skb_cloned(skb) && !skb_is_nonlinear(skb) && (headroom + tailroom) >= 8) {
-		if (headroom < 8) {
-			skb->data = memmove(skb->head + 8, skb->data, skb->len);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
-			skb->tail = skb->data + skb->len;
-#else
-			skb_set_tail_pointer(skb, skb->len);
-#endif
+
+	if(skb_is_nonlinear(skb))
+	{
+		if(tailroom_required > 0)
+		{
+			/*
+			 * doing pskb_expand_head() first to create enough header space in the input skb before linearising it,
+			 * so that the resulting linear buffer contains the additional headroom/tailroom needed
+			 */
+			additional_tailroom = skb->data_len + tailroom_required - (skb->end - skb->tail);
+			additional_tailroom = additional_tailroom > 0 ? additional_tailroom : 0;
+			if(pskb_expand_head(skb, additional_headroom, additional_tailroom, flags) || skb_linearize(skb))
+			{
+				dev_kfree_skb_any(skb);
+				return NULL;
+			}
 		}
-	} else {
-		struct sk_buff *skb2 = NULL;
-		skb2 = skb_copy_expand(skb, 8, 0, flags);
-		dev_kfree_skb_any(skb);
-		skb = skb2;
-		if (!skb)
-			return NULL;
+		else if(skb_cloned(skb) || additional_headroom > 0)
+		{
+			if(pskb_expand_head(skb, additional_headroom, additional_tailroom, flags))
+			{
+				dev_kfree_skb_any(skb);
+				return NULL;
+			}
+		}
+	}
+	else //!skb_is_nonlinear(skb)
+	{
+		/*
+		* the manipulatiton of the skb buffer with memmove() is safe only when !skb_cloned(skb) and !skb_is_nonlinear(skb)
+		*/
+		if (!skb_cloned(skb) && (headroom + tailroom) >= (headroom_required + tailroom_required)) {
+			if (headroom < headroom_required || tailroom < tailroom_required) {
+				skb->data = memmove(skb->head + headroom_required, skb->data, skb->len);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
+				skb->tail = skb->data + skb->len;
+#else
+				skb_set_tail_pointer(skb, skb->len);
+#endif
+			}
+		}
+		else //skb_cloned(skb) || not enough room
+		{
+			if(pskb_expand_head(skb, additional_headroom, additional_tailroom, flags))
+			{
+				dev_kfree_skb_any(skb);
+				return NULL;
+			}
+
+		}
+
 	}
 
 	skb_push(skb, 4);
@@ -2075,19 +2157,17 @@ static int ax88179_link_reset(struct usbnet *dev)
 	if (*tmp16 & GMII_PHY_PHYSR_FULL)
 		*mode |= AX_MEDIUM_FULL_DUPLEX;	/* Bit 1 : FD */
 
-	if(rx_urb_size > 0)
-		dev->rx_urb_size = (1024 * rx_urb_size);
-	else
-		dev->rx_urb_size = (1024 * (tmp[3] + 2));
+	dev->rx_urb_size = (1024 * (tmp[3] + 2));
 	
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
-		netdev_info(dev->net, "rx_urb_size = %u KB, hard_mtu = %u\n", dev->rx_urb_size >> 10, dev->hard_mtu);
-		netdev_info(dev->net, "Write medium type: 0x%04x\n", *mode);
+	netdev_info(dev->net, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], dev->rx_urb_size >> 10, dev->hard_mtu);
+	netdev_info(dev->net, "Write medium type: 0x%04x\n", *mode);
 #else
-		devinfo(dev, "rx_urb_size = %u KB, hard_mtu = %u\n", dev->rx_urb_size >> 10, dev->hard_mtu);
-		devinfo(dev, "Write medium type: 0x%04x\n", *mode);
+	devinfo(dev, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], dev->rx_urb_size >> 10, dev->hard_mtu);
+	devinfo(dev, "Write medium type: 0x%04x\n", *mode);
 #endif
+
 	
 	ax88179_read_cmd(dev, 0x81, 0x8c, 0, 4, tmp32, 1);
 	delay = HZ / 2;

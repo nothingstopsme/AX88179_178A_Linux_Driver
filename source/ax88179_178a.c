@@ -1036,7 +1036,9 @@ static const struct net_device_ops ax88179_netdev_ops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
 	.ndo_set_features	= ax88179_set_features,
 #endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+	.ndo_get_stats64	= dev_get_tstats64,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
 	.ndo_get_stats64	= usbnet_get_stats64,
 #endif
 };
@@ -1778,9 +1780,49 @@ ax88179_rx_checksum(struct sk_buff *skb, u32 *pkt_hdr)
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 }
 
-static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
+/*
+* According to the documentation in skbuff.h, NET_IP_ALIGN corresponds to the number of extra bytes which should be placed before an ethernet header for the purpose of ip header alignment.
+* When NET_IP_ALIGN == 2, the hardware acceleration is used to add extra 2 bytes at the begining of each packet,
+* and therefore we do not need to allocate the space in this case; instead, we just skip them (moving the 2 bytes into the headroom).
+* In all other cases excluding NET_IP_ALIGN = 0, we have to allocate that much space as the headroom
+*/
+#if (NET_IP_ALIGN != 0 && NET_IP_ALIGN != 2)
+#define RX_REQUESTED_HEADROOM NET_IP_ALIGN
+#define RX_HEADER_SKIP 0
+#else
+#define RX_REQUESTED_HEADROOM 0
+#define RX_HEADER_SKIP NET_IP_ALIGN
+#endif
+
+static void ax88179_rx_skb_copy_and_return(struct usbnet *dev, struct sk_buff *skb)
 {
 	struct sk_buff *ax_skb = NULL;
+#if RX_REQUESTED_HEADROOM > 0
+	ax_skb = __pskb_copy(skb, RX_REQUESTED_HEADROOM, GFP_ATOMIC);
+#else
+	ax_skb = skb_clone(skb, GFP_ATOMIC);
+#endif
+
+	if (ax_skb) {
+#if RX_HEADER_SKIP > 0
+			skb_pull(ax_skb, RX_HEADER_SKIP);
+#endif
+
+		usbnet_skb_return(dev, ax_skb);					
+	}
+	else
+	{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
+		netdev_err(dev->net, "Failed to extract the current packet; dropping it.");
+#else
+		deverr(dev, "Failed to extract the current packet; dropping it");
+#endif
+		dev->net->stats.rx_dropped++;
+	}
+}
+
+static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
+{
 	int pkt_cnt = 0;
 	u32 rx_hdr = 0;
 	u16 hdr_off = 0;
@@ -1791,8 +1833,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	u8 *pkt_payload = NULL;
 	bool need_returning = false;
 	int last_status = 0;
-	u32 skip = 0, headroom = 0;
-	u8 extra_header_len = 0;
+	u32 skip = 0;
 
 	if (skb->len == 0) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
@@ -1818,11 +1859,6 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	pkt_payload = (u8 *)skb->data;
 	pkt_hdr = (u32 *)(skb->data + hdr_off);
 	
-	// For the case NET_IP_ALIGN == 2, the hardware has done it for us
-	if (NET_IP_ALIGN != 0 && NET_IP_ALIGN != 2)
-		extra_header_len = NET_IP_ALIGN;
-	else
-		extra_header_len = 0;
 
 
 	skb->ip_summed = CHECKSUM_NONE;
@@ -1868,24 +1904,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 					so that the manipulation of the headroom of one packet does not corrupt the data of those residing before it in the packet sequence
 				*/
 				//ax_skb = skb_clone(skb, GFP_ATOMIC);
-				ax_skb = __pskb_copy(skb, extra_header_len, GFP_ATOMIC);
-
-				if (ax_skb) {
-					//increasing the len of header by prepending it with extra bytes if required
-					if(extra_header_len > 0)
-						skb_push(ax_skb, extra_header_len);
-
-					usbnet_skb_return(dev, ax_skb);					
-				}
-				else
-				{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
-					netdev_err(dev->net, "Failed to extract the current packet; dropping it.");
-#else
-					deverr(dev, "Failed to extract the current packet; dropping it");
-#endif
-					dev->net->stats.rx_dropped++;
-				}
+				ax88179_rx_skb_copy_and_return(dev, skb);
 			}
 			need_returning = false;
 		}
@@ -1917,25 +1936,69 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 
 	}
 
+	/*
+	* At this point, the input skb should point to the last packet in the packet sequence with AX_RXHDR_DROP_ERR off, 
+	* with last_status indicating whether an error is detected while processing that packet
+	*/
+
 
 	if(last_status)
 	{
 		//Increasing the len of header of the last packet available for returning by prepending it with extra bytes if required
-		headroom = skb_headroom(skb);
-		if(headroom < extra_header_len)
-			last_status = !pskb_expand_head(skb, extra_header_len-headroom, 0, GFP_ATOMIC)?1:0;
-		
-		if(last_status && extra_header_len > 0)
-			skb_push(skb, extra_header_len);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+		/*
+		*	FLAG_MULTI_PACKET is on:
+		* The last packet needs to be copied and returned here,
+		* and the destruction of the input skb will be handled by usbnet
+		*/
+		ax88179_rx_skb_copy_and_return(dev, skb);
+#else
+		/*
+		* FLAG_MULTI_PACKET is off: 
+		* The last packet is only made ready as the input skb without returning,
+		* and usbnet will proceed to process it after this function returns.
+		*/
 
+		u32 headroom = skb_headroom(skb);
+		if(headroom < RX_REQUESTED_HEADROOM)
+			last_status = !pskb_expand_head(skb, RX_REQUESTED_HEADROOM-headroom, 0, GFP_ATOMIC)?1:0;
+		
+		if(last_status)
+		{
+#if RX_HEADER_SKIP > 0
+			skb_pull(skb, RX_HEADER_SKIP);
+#endif
+			
+			headroom = RX_REQUESTED_HEADROOM + RX_HEADER_SKIP;
+
+			if((skb->head + headroom) != skb->data)
+			{
+				skb->data = memmove(skb->head + headroom, skb->data, skb->len);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
+				skb->tail = skb->data + skb->len;
+#else
+				skb_set_tail_pointer(skb, skb->len);
+#endif
+			}
+		}
+#endif
 	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	else
+	{
+		/*
+		*	FLAG_MULTI_PACKET is on:
+		* errors are also reported here
+		*/
+
+		dev->net->stats.rx_errors++;
+		last_status = 1;
+	}
+#endif
 
 	/*
-	* At this point, the input skb should point to the last packet in the packet sequence with AX_RXHDR_DROP_ERR off, with last_status indicating whether an error is detected while processing that packet;
-	* usbnet will proceed to process what is left after this function returns.
 	*
-	* By this strategy the mini-driver can extract multiple packets inside an input skb while keeping the packet statistics correctly reported (hopefully), 
-	* without resort to the flag FLAG_MULTI_PACKET
+	* By this strategy the mini-driver can extract multiple packets inside an input skb while keeping the packet statistics correctly reported (hopefully), whether FLAG_MULTI_PACKET is enabled or not.
 	*
 	*/
 
@@ -1950,37 +2013,15 @@ static struct sk_buff *
 ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 {
 	u32 tx_hdr1 = 0, tx_hdr2 = 0;
-	int frame_size = dev->maxpacket;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24)
 	int mss = skb_shinfo(skb)->gso_size;
 #else
 	int mss = 0;
 #endif
-	int headroom = 0, headroom_required = 8, additional_headroom = 0;
-	int tailroom = 0, tailroom_required = 0, additional_tailroom = 0;
+	int headroom = 0, tailroom = 0, headroom_required = 8, additional_headroom = 0;
 
 	tx_hdr1 = skb->len;
 	tx_hdr2 = mss;
-	if (((skb->len + headroom_required) % frame_size) == 0)
-	{
-		netdev_dbg(dev->net, "tx payload length(%u) is divisible by frame_size(%d), tailroom = %d, skb_cloned(skb) = %d, skb_is_nonlinear(skb) = %d, skb_shinfo(skb)->nr_frags = %hhu", 
-								skb->len + 8, frame_size, skb_tailroom(skb), skb_cloned(skb), skb_is_nonlinear(skb), skb_shinfo(skb)->nr_frags);
-		tx_hdr2 |= 0x80008000;	/* Enable padding */
-		/* 
-		* In this case, as usbnet will pad one extra byte for us later, the actual length should be skb->len + 1
-		*/
-		tx_hdr1 += 1;
-
-
-		/*
-		* If nr_frags == 0, usbnet will expect there is a at least one-byte tail room and use it to send a padding frame to signal the end of usb frame transmission;
-		* therefore we have to make sure such a tail room is available
-		* 
-		*/
-		if(skb_shinfo(skb)->nr_frags == 0)
-			tailroom_required = 1;
-
-	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0)
 	if (!dev->can_dma_sg && (dev->net->features & NETIF_F_SG) &&
@@ -2001,32 +2042,17 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 	tailroom = skb_tailroom(skb);
 
 	additional_headroom = headroom < headroom_required ? headroom_required - headroom : 0;
-	additional_tailroom = tailroom < tailroom_required ? tailroom_required - tailroom : 0;
 
 	/*
-	* Various checks and pskb_expand_head() below to make sure each skb has its own headroom and tailroom,
+	* Various checks and pskb_expand_head() below to make sure each skb has its own headroom,
 	* so that the use of those rooms in one packet does not corrupt data in the others
 	*/
 
 	if(skb_is_nonlinear(skb))
 	{
-		if(tailroom_required > 0)
+		if(skb_header_cloned(skb) || additional_headroom > 0)
 		{
-			/*
-			 * doing pskb_expand_head() first to create enough header space in the input skb before linearising it,
-			 * so that the resulting linear buffer contains the additional headroom/tailroom needed
-			 */
-			additional_tailroom = skb->data_len + tailroom_required - (skb->end - skb->tail);
-			additional_tailroom = additional_tailroom > 0 ? additional_tailroom : 0;
-			if(pskb_expand_head(skb, additional_headroom, additional_tailroom, flags) || skb_linearize(skb))
-			{
-				dev_kfree_skb_any(skb);
-				return NULL;
-			}
-		}
-		else if(skb_cloned(skb) || additional_headroom > 0)
-		{
-			if(pskb_expand_head(skb, additional_headroom, additional_tailroom, flags))
+			if(pskb_expand_head(skb, additional_headroom, 0, flags))
 			{
 				dev_kfree_skb_any(skb);
 				return NULL;
@@ -2038,8 +2064,8 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 		/*
 		* the manipulatiton of the skb buffer with memmove() is safe only when !skb_cloned(skb) and !skb_is_nonlinear(skb)
 		*/
-		if (!skb_cloned(skb) && (headroom + tailroom) >= (headroom_required + tailroom_required)) {
-			if (headroom < headroom_required || tailroom < tailroom_required) {
+		if (!skb_cloned(skb) && (headroom + tailroom) >= headroom_required) {
+			if (headroom < headroom_required) {
 				skb->data = memmove(skb->head + headroom_required, skb->data, skb->len);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
 				skb->tail = skb->data + skb->len;
@@ -2050,7 +2076,7 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 		}
 		else //skb_cloned(skb) || not enough room
 		{
-			if(pskb_expand_head(skb, additional_headroom, additional_tailroom, flags))
+			if(pskb_expand_head(skb, additional_headroom, 0, flags))
 			{
 				dev_kfree_skb_any(skb);
 				return NULL;
@@ -2074,6 +2100,10 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 	memcpy(skb->data, &tx_hdr1, 4);
 #else
 	skb_copy_to_linear_data(skb, &tx_hdr1, 4);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 13)
+	usbnet_set_skb_tx_stats(skb, 1, skb->len);	
 #endif
 
 	return skb;
@@ -2161,13 +2191,12 @@ static int ax88179_link_reset(struct usbnet *dev)
 	
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
-	netdev_info(dev->net, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], dev->rx_urb_size >> 10, dev->hard_mtu);
+	netdev_info(dev->net, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], (unsigned int)(dev->rx_urb_size >> 10), dev->hard_mtu);
 	netdev_info(dev->net, "Write medium type: 0x%04x\n", *mode);
 #else
-	devinfo(dev, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], dev->rx_urb_size >> 10, dev->hard_mtu);
+	devinfo(dev, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], (unsigned int)(dev->rx_urb_size >> 10), dev->hard_mtu);
 	devinfo(dev, "Write medium type: 0x%04x\n", *mode);
 #endif
-
 	
 	ax88179_read_cmd(dev, 0x81, 0x8c, 0, 4, tmp32, 1);
 	delay = HZ / 2;
@@ -2386,7 +2415,10 @@ static const struct driver_info ax88179_info = {
 	.status	= ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset	= ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop	= ax88179_stop,
+	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop	= ax88179_stop,
 	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else
@@ -2405,7 +2437,10 @@ static const struct driver_info ax88178a_info = {
 	.status	= ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset	= ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop	= ax88179_stop,
+	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop	= ax88179_stop,
 	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else
@@ -2422,7 +2457,10 @@ static const struct driver_info sitecom_info = {
 	.status	= ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset	= ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop	= ax88179_stop,
+	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop	= ax88179_stop,
 	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else
@@ -2439,7 +2477,10 @@ static const struct driver_info lenovo_info = {
 	.status	= ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset	= ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop	= ax88179_stop,
+	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop	= ax88179_stop,
 	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else
@@ -2456,7 +2497,10 @@ static const struct driver_info toshiba_info = {
 	.status	= ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset	= ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop	= ax88179_stop,
+	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop	= ax88179_stop,
 	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else
@@ -2473,7 +2517,10 @@ static const struct driver_info samsung_info = {
 	.status = ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset	= ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop	= ax88179_stop,
+	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop	= ax88179_stop,
 	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else
@@ -2490,7 +2537,10 @@ static const struct driver_info dlink_info = {
 	.status = ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset	= ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop	= ax88179_stop,
+	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop	= ax88179_stop,
 	.flags	= FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else
@@ -2507,7 +2557,10 @@ static const struct driver_info mct_info = {
 	.status = ax88179_status,
 	.link_reset = ax88179_link_reset,
 	.reset  = ax88179_reset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+	.stop   = ax88179_stop,
+	.flags  = FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS | FLAG_MULTI_PACKET,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32)
 	.stop   = ax88179_stop,
 	.flags  = FLAG_ETHER | FLAG_FRAMING_AX | FLAG_AVOID_UNLINK_URBS,
 #else

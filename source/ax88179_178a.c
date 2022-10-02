@@ -963,8 +963,6 @@ static int ax88179_set_mac_addr(struct net_device *net, void *p)
 	struct sockaddr *addr = p;
 	int ret;
 
-	if (netif_running(net))
-		return -EBUSY;
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 

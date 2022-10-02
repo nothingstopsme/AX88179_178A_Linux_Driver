@@ -53,7 +53,12 @@
 
 #define AX_RX_CTL				0x0b
 	#define AX_RX_CTL_DROPCRCERR	0x0100
-	#define AX_RX_CTL_IPE		0x0200
+	/*
+	* According to the comments from the vendor's outdated source code,
+	* AX_RX_CTL_IPE signals the hardware to do 32-bit(4-byte) ip header alignment,
+	* which is equivalent to the concept of NET_IP_ALIGN = 2, as described in skbuff.h. 
+	*/
+	#define AX_RX_CTL_IPE		0x0200 
 	#define AX_RX_CTL_START		0x0080
 	#define AX_RX_CTL_AP		0x0020
 	#define AX_RX_CTL_AM		0x0010
@@ -858,7 +863,10 @@ static void ax88179_set_multicast(struct net_device *net)
 	struct ax88179_data *data = dev->driver_priv;
 	u8 *m_filter = ((u8 *)dev->data);
 
-	data->rxctl = (AX_RX_CTL_START | AX_RX_CTL_AB | AX_RX_CTL_IPE);
+	data->rxctl = (AX_RX_CTL_START | AX_RX_CTL_AB);
+
+	if (NET_IP_ALIGN == 2)
+		data->rxctl |= AX_RX_CTL_IPE;
 
 	if (net->flags & IFF_PROMISC) {
 		data->rxctl |= AX_RX_CTL_PRO;
@@ -1346,6 +1354,20 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	u16 hdr_off;
 	u32 *pkt_hdr;
 
+	/*
+	* According to the documentation in skbuff.h, NET_IP_ALIGN corresponds to the number of extra bytes which should be placed before an ethernet header for the purpose of ip header alignment.
+	* When NET_IP_ALIGN == 2, the hardware acceleration is used to add extra 2 bytes at the begining of each packet,
+	* and therefore we do not need to allocate the space in this case; instead, we just skip them (moving the 2 bytes into the headroom).
+	* In all other cases excluding NET_IP_ALIGN = 0, we have to allocate that much space as the headroom
+	*/
+	#if (NET_IP_ALIGN != 0 && NET_IP_ALIGN != 2)
+		#define RX_REQUESTED_HEADROOM NET_IP_ALIGN
+		#define RX_HEADER_SKIP 0
+	#else
+		#define RX_REQUESTED_HEADROOM 0
+		#define RX_HEADER_SKIP NET_IP_ALIGN
+	#endif
+
 	/* At the end of the SKB, there's a header telling us how many packets
 	 * are bundled into this buffer and where we can find an array of
 	 * per-packet metadata (which contains elements encoded into u16).
@@ -1424,13 +1446,16 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 
 		/* Check CRC or runt packet */
 		if ((*pkt_hdr & (AX_RXHDR_CRC_ERR | AX_RXHDR_DROP_ERR)) ||
-		    pkt_len < 2 + ETH_HLEN) {
+		    pkt_len < RX_HEADER_SKIP + ETH_HLEN) {
 			dev->net->stats.rx_errors++;
 			skb_pull(skb, pkt_len_plus_padd);
 			continue;
 		}
-
+		#if RX_REQUESTED_HEADROOM > 0
+		ax_skb = __pskb_copy(skb, RX_REQUESTED_HEADROOM, GFP_ATOMIC);
+		#else
 		ax_skb = skb_clone(skb, GFP_ATOMIC);
+		#endif
 		if (!ax_skb)
 		{
 			// reporting a packet dropped, and continuing parsing the rest
@@ -1439,8 +1464,9 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		}
 		skb_trim(ax_skb, pkt_len);
 
-		/* Skip IP alignment pseudo header */
-		skb_pull(ax_skb, 2);
+		#if RX_HEADER_SKIP > 0
+		skb_pull(ax_skb, RX_HEADER_SKIP);
+		#endif
 
 		skb->truesize = SKB_TRUESIZE(pkt_len);
 		ax88179_rx_checksum(ax_skb, pkt_hdr);
@@ -1610,8 +1636,10 @@ static int ax88179_reset(struct usbnet *dev)
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_TXCOE_CTL, 1, 1, tmp);
 
 	/* Configure RX control register => start operation */
-	*tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_IPE | AX_RX_CTL_START |
+	*tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START |
 		 AX_RX_CTL_AP | AX_RX_CTL_AMALL | AX_RX_CTL_AB;
+	if (NET_IP_ALIGN == 2)
+		*tmp16 |= AX_RX_CTL_IPE;
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, tmp16);
 
 	*tmp = AX_MONITOR_MODE_PMETYPE | AX_MONITOR_MODE_PMEPOL |

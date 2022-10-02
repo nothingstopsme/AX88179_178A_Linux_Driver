@@ -1437,7 +1437,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			/* Skip IP alignment pseudo header */
 			skb_pull(skb, 2);
 
-			skb->truesize = SKB_TRUESIZE(pkt_len_plus_padd);
+			skb->truesize = SKB_TRUESIZE(pkt_len);
 			ax88179_rx_checksum(skb, pkt_hdr);
 			return 1;
 		}
@@ -1450,8 +1450,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		/* Skip IP alignment pseudo header */
 		skb_pull(ax_skb, 2);
 
-		skb->truesize = pkt_len_plus_padd +
-				SKB_DATA_ALIGN(sizeof(struct sk_buff));
+		skb->truesize = SKB_TRUESIZE(pkt_len);
 		ax88179_rx_checksum(ax_skb, pkt_hdr);
 		usbnet_skb_return(dev, ax_skb);
 
@@ -1477,7 +1476,10 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 	headroom = skb_headroom(skb) - 8;
 
 	if ((dev->net->features & NETIF_F_SG) && skb_linearize(skb))
+	{
+		dev_kfree_skb_any(skb);
 		return NULL;
+	}
 
 	if ((skb_header_cloned(skb) || headroom < 0) &&
 	    pskb_expand_head(skb, headroom < 0 ? 8 : 0, 0, GFP_ATOMIC)) {

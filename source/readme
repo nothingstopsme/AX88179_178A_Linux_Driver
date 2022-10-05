@@ -103,3 +103,8 @@ bGETH=x (0 or 1)
 	0: Disable the Green Ethernet
 	1: Enalbe the Green Ethernet
 	The default value is 0 that will disable the Green Ethernet function.
+
+tx_dma_sg=x (0(no) or 1(yes))
+	Enable/Disable the dma_sg feature for tx if supported.
+	0 or no: Disable the feature (default)
+	1 or yes: Enable the feature if supported

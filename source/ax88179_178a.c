@@ -76,6 +76,10 @@ module_param(bGETH, int, 0);
 MODULE_PARM_DESC(bGETH, "Green ethernet configuration");
 /* ASIX AX88179/178A based USB 3.0/2.0 Gigabit Ethernet Devices */
 
+static bool tx_dma_sg = false;
+module_param(tx_dma_sg, bool, 0);
+MODULE_PARM_DESC(tx_dma_sg, "Whether to use the dma_sg feature for tx if supported, \"no\" by default");
+
 static int __ax88179_read_cmd(struct usbnet *dev, u8 cmd, u16 value, u16 index,
 			      u16 size, void *data, int in_pm)
 {
@@ -553,9 +557,10 @@ static int ax88179_resume(struct usb_interface *intf)
 	tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START | AX_RX_CTL_AP |
 		 AX_RX_CTL_AMALL | AX_RX_CTL_AB;
 
+#if NET_IP_ALIGN == 2
 	// Using hardward alignment when NET_IP_ALIGN == 2
-	if (NET_IP_ALIGN == 2)
-		tmp16 |= AX_RX_CTL_IPE;
+	tmp16 |= AX_RX_CTL_IPE;
+#endif
 	
 	ax88179_write_cmd_nopm(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, &tmp16);
 
@@ -848,9 +853,10 @@ static void ax88179_set_multicast(struct net_device *net)
 
 	data->rxctl = (AX_RX_CTL_START | AX_RX_CTL_AB);
 	
+#if NET_IP_ALIGN == 2
 	// Using hardward alignment when NET_IP_ALIGN == 2
-	if (NET_IP_ALIGN == 2)
-		data->rxctl |= AX_RX_CTL_IPE;
+	data->rxctl |= AX_RX_CTL_IPE;
+#endif
 
 	if (net->flags & IFF_PROMISC) {
 		data->rxctl |= AX_RX_CTL_PRO;
@@ -1657,8 +1663,10 @@ static int ax88179_bind(struct usbnet *dev, struct usb_interface *intf)
 	dev->net->features |= NETIF_F_IPV6_CSUM;
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0)
-	if (usb_device_no_sg_constraint(dev->udev))
+	if (tx_dma_sg && usb_device_no_sg_constraint(dev->udev))
 		dev->can_dma_sg = 1;
+	else
+		dev->can_dma_sg = 0;
 	dev->net->features |= NETIF_F_SG | NETIF_F_TSO;
 #endif
 
@@ -1683,9 +1691,10 @@ static int ax88179_bind(struct usbnet *dev, struct usb_interface *intf)
 	tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START | AX_RX_CTL_AP |
 		 AX_RX_CTL_AMALL | AX_RX_CTL_AB;
 	
+#if NET_IP_ALIGN == 2
 	// Using hardward alignment when NET_IP_ALIGN == 2
-	if (NET_IP_ALIGN == 2)
-		tmp16 |= AX_RX_CTL_IPE;
+	tmp16 |= AX_RX_CTL_IPE;
+#endif
 	
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, &tmp16);
 
@@ -1810,8 +1819,7 @@ static void ax88179_rx_skb_copy_and_return(struct usbnet *dev, struct sk_buff *s
 
 		usbnet_skb_return(dev, ax_skb);					
 	}
-	else
-	{
+	else {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
 		netdev_err(dev->net, "Failed to extract the current packet; dropping it.");
 #else
@@ -1893,12 +1901,10 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		*	the current one (if located, as indicated by need_returning) needs to be copied and returned, 
 		* with the corresponding error status reported if there is something wrong.
 		*/
-		if(need_returning)
-		{
-			if(!last_status)
+		if (need_returning) {
+			if (!last_status)
 				dev->net->stats.rx_errors++;
-			else
-			{
+			else {
 				/*
 					Doing (partial) packet copying instead of cloning to make sure each extracted packet has its own headroom, 
 					so that the manipulation of the headroom of one packet does not corrupt the data of those residing before it in the packet sequence
@@ -1921,7 +1927,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		skb_set_tail_pointer(skb, skb->len);
 #endif
 		
-		skb->truesize = SKB_TRUESIZE(skb->len);
+		skb->truesize = SKB_TRUESIZE(skb->len+RX_REQUESTED_HEADROOM);
 		ax88179_rx_checksum(skb, pkt_hdr);
 
 		// Advancing to the next packet along the packet sequence
@@ -1942,8 +1948,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	*/
 
 
-	if(last_status)
-	{
+	if (last_status) {
 		//Increasing the len of header of the last packet available for returning by prepending it with extra bytes if required
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
 		/*
@@ -1960,19 +1965,17 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		*/
 
 		u32 headroom = skb_headroom(skb);
-		if(headroom < RX_REQUESTED_HEADROOM)
+		if (headroom < RX_REQUESTED_HEADROOM)
 			last_status = !pskb_expand_head(skb, RX_REQUESTED_HEADROOM-headroom, 0, GFP_ATOMIC)?1:0;
 		
-		if(last_status)
-		{
+		if (last_status) {
 #if RX_HEADER_SKIP > 0
 			skb_pull(skb, RX_HEADER_SKIP);
 #endif
 			
 			headroom = RX_REQUESTED_HEADROOM + RX_HEADER_SKIP;
 
-			if((skb->head + headroom) != skb->data)
-			{
+			if ((skb->head + headroom) != skb->data) {
 				skb->data = memmove(skb->head + headroom, skb->data, skb->len);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 22)
 				skb->tail = skb->data + skb->len;
@@ -1984,8 +1987,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 #endif
 	}
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
-	else
-	{
+	else {
 		/*
 		*	FLAG_MULTI_PACKET is on:
 		* errors are also reported here
@@ -2048,19 +2050,15 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 	* so that the use of those rooms in one packet does not corrupt data in the others
 	*/
 
-	if(skb_is_nonlinear(skb))
-	{
-		if(skb_header_cloned(skb) || additional_headroom > 0)
-		{
-			if(pskb_expand_head(skb, additional_headroom, 0, flags))
-			{
+	if (skb_is_nonlinear(skb)) {
+		if (skb_header_cloned(skb) || additional_headroom > 0) {
+			if (pskb_expand_head(skb, additional_headroom, 0, flags)) {
 				dev_kfree_skb_any(skb);
 				return NULL;
 			}
 		}
 	}
-	else //!skb_is_nonlinear(skb)
-	{
+	else { //!skb_is_nonlinear(skb)
 		/*
 		* the manipulatiton of the skb buffer with memmove() is safe only when !skb_cloned(skb) and !skb_is_nonlinear(skb)
 		*/
@@ -2074,16 +2072,12 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 #endif
 			}
 		}
-		else //skb_cloned(skb) || not enough room
-		{
-			if(pskb_expand_head(skb, additional_headroom, 0, flags))
-			{
+		else { //skb_cloned(skb) || not enough room
+			if (pskb_expand_head(skb, additional_headroom, 0, flags)) {
 				dev_kfree_skb_any(skb);
 				return NULL;
 			}
-
 		}
-
 	}
 
 	skb_push(skb, 4);
@@ -2103,7 +2097,7 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 13)
-	usbnet_set_skb_tx_stats(skb, 1, skb->len);	
+	usbnet_set_skb_tx_stats(skb, skb_shinfo(skb)->gso_segs ?: 1, 0);
 #endif
 
 	return skb;
@@ -2191,9 +2185,11 @@ static int ax88179_link_reset(struct usbnet *dev)
 	
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
+	netdev_info(dev->net, "tx_dma_sg = %d, dev->can_dma_sg = %d\n", tx_dma_sg, dev->can_dma_sg);
 	netdev_info(dev->net, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], (unsigned int)(dev->rx_urb_size >> 10), dev->hard_mtu);
 	netdev_info(dev->net, "Write medium type: 0x%04x\n", *mode);
 #else
+	devinfo(dev, "tx_dma_sg = %d, dev->can_dma_sg = %d\n", tx_dma_sg, dev->can_dma_sg);
 	devinfo(dev, "bsize = %hhu, rx_urb_size = %u KB, hard_mtu = %u\n", tmp[3], (unsigned int)(dev->rx_urb_size >> 10), dev->hard_mtu);
 	devinfo(dev, "Write medium type: 0x%04x\n", *mode);
 #endif
@@ -2316,8 +2312,10 @@ static int ax88179_reset(struct usbnet *dev)
 	dev->net->features |= NETIF_F_IPV6_CSUM;
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0)
-	if (usb_device_no_sg_constraint(dev->udev))
+	if (tx_dma_sg && usb_device_no_sg_constraint(dev->udev))
 		dev->can_dma_sg = 1;
+	else
+		dev->can_dma_sg = 0;
 	dev->net->features |= NETIF_F_SG | NETIF_F_TSO;
 #endif
 
@@ -2342,9 +2340,10 @@ static int ax88179_reset(struct usbnet *dev)
 	*tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START | AX_RX_CTL_AP |
 		 AX_RX_CTL_AMALL | AX_RX_CTL_AB;
 	
+#if NET_IP_ALIGN == 2
 	// Using hardward alignment when NET_IP_ALIGN == 2
-	if (NET_IP_ALIGN == 2)
-		*tmp16 |= AX_RX_CTL_IPE;
+	*tmp16 |= AX_RX_CTL_IPE;
+#endif
 	
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, tmp16);
 

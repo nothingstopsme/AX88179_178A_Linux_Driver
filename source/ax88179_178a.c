@@ -865,8 +865,9 @@ static void ax88179_set_multicast(struct net_device *net)
 
 	data->rxctl = (AX_RX_CTL_START | AX_RX_CTL_AB);
 
-	if (NET_IP_ALIGN == 2)
-		data->rxctl |= AX_RX_CTL_IPE;
+	#if NET_IP_ALIGN == 2
+	data->rxctl |= AX_RX_CTL_IPE;
+	#endif
 
 	if (net->flags & IFF_PROMISC) {
 		data->rxctl |= AX_RX_CTL_PRO;
@@ -1429,6 +1430,7 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	for (; pkt_cnt > 0; pkt_cnt--, pkt_hdr++) {
 		u16 pkt_len_plus_padd;
 		u16 pkt_len;
+		unsigned int skb_len;
 
 		le32_to_cpus(pkt_hdr);
 		pkt_len = (*pkt_hdr >> 16) & 0x1fff;
@@ -1449,8 +1451,12 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			skb_pull(skb, pkt_len_plus_padd);
 			continue;
 		}
+
+		skb_len = skb->len;
 		#if RX_REQUESTED_HEADROOM > 0
+		skb_trim(skb, pkt_len);
 		ax_skb = __pskb_copy(skb, RX_REQUESTED_HEADROOM, GFP_ATOMIC);
+		__skb_set_length(skb, skb_len);
 		#else
 		ax_skb = skb_clone(skb, GFP_ATOMIC);
 		#endif
@@ -1460,13 +1466,14 @@ static int ax88179_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			dev->net->stats.rx_dropped++;	
 			continue;
 		}
+
 		skb_trim(ax_skb, pkt_len);
 
 		#if RX_HEADER_SKIP > 0
 		skb_pull(ax_skb, RX_HEADER_SKIP);
 		#endif
 
-		skb->truesize = SKB_TRUESIZE(pkt_len);
+		skb->truesize = SKB_TRUESIZE(pkt_len+RX_REQUESTED_HEADROOM);
 		ax88179_rx_checksum(ax_skb, pkt_hdr);
 		usbnet_skb_return(dev, ax_skb);
 
@@ -1504,7 +1511,7 @@ ax88179_tx_fixup(struct usbnet *dev, struct sk_buff *skb, gfp_t flags)
 	put_unaligned_le32(tx_hdr1, ptr);
 	put_unaligned_le32(tx_hdr2, ptr + 4);
 
-	usbnet_set_skb_tx_stats(skb, 1, skb->len);
+	usbnet_set_skb_tx_stats(skb, skb_shinfo(skb)->gso_segs ?: 1, 0);
 
 	return skb;
 }
@@ -1636,8 +1643,9 @@ static int ax88179_reset(struct usbnet *dev)
 	/* Configure RX control register => start operation */
 	*tmp16 = AX_RX_CTL_DROPCRCERR | AX_RX_CTL_START |
 		 AX_RX_CTL_AP | AX_RX_CTL_AMALL | AX_RX_CTL_AB;
-	if (NET_IP_ALIGN == 2)
-		*tmp16 |= AX_RX_CTL_IPE;
+	#if NET_IP_ALIGN == 2
+	*tmp16 |= AX_RX_CTL_IPE;
+	#endif
 	ax88179_write_cmd(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, 2, tmp16);
 
 	*tmp = AX_MONITOR_MODE_PMETYPE | AX_MONITOR_MODE_PMEPOL |

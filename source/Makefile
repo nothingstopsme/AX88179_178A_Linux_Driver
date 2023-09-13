@@ -37,8 +37,8 @@ install:
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm *.mod
+	rm -f *.mod
 
-.PHONY: modules clean
+.PHONY: modules install clean
 
 -include $(KDIR)/Rules.make

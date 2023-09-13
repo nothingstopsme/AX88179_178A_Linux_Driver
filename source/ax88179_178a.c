@@ -1269,14 +1269,43 @@ static void ax88179_get_mac_addr(struct usbnet *dev)
 static int ax88179_bind(struct usbnet *dev, struct usb_interface *intf)
 {
 	struct ax88179_data *ax179_data;
+	struct usb_host_interface *current_alt = NULL;
+	u32 tmp32;
+	int ret;
 
 	usbnet_get_endpoints(dev, intf);
+	current_alt = intf->cur_altsetting;
 
 	ax179_data = kzalloc(sizeof(*ax179_data), GFP_KERNEL);
 	if (!ax179_data)
 		return -ENOMEM;
 
 	dev->driver_priv = ax179_data;
+
+	tmp32 = 0;
+	// The write operation below is used by the vendor driver as the very first control attempt;
+	// since we need a nudge at the hardware to turn it into the vendor specific mode,
+	// this one is believed to be a good choice.
+	ret = ax88179_write_cmd(dev, 0x81, 0x310, 0, 4, &tmp32);
+	if (ret < 0) {
+		if(!current_alt)
+			netdev_dbg(dev->net, "cur_altsetting is null");
+		else if (current_alt->desc.bInterfaceClass != 0xff || current_alt->desc.bInterfaceSubClass != 0xff)
+			netdev_dbg(dev->net, "interface: class = 0x%02X, subclass = 0x%02X", current_alt->desc.bInterfaceClass, current_alt->desc.bInterfaceSubClass);
+		else // keep doing rest of operations in this case
+			goto binding_ops;
+
+
+		netdev_warn(dev->net, "Unexpected interface setting; aborting binding as the hardware should redeclare itself differently later");
+		if (dev->driver_priv) {
+			kfree(dev->driver_priv);
+			dev->driver_priv = NULL;
+		}
+
+		return ret;
+	}
+
+binding_ops:
 
 	dev->net->netdev_ops = &ax88179_netdev_ops;
 	dev->net->ethtool_ops = &ax88179_ethtool_ops;
@@ -1842,55 +1871,55 @@ static const struct driver_info at_umc2000sp_info = {
 static const struct usb_device_id products[] = {
 {
 	/* ASIX AX88179 10/100/1000 */
-	USB_DEVICE_AND_INTERFACE_INFO(0x0b95, 0x1790, 0xff, 0xff, 0),
+	USB_DEVICE(0x0b95, 0x1790),
 	.driver_info = (unsigned long)&ax88179_info,
 }, {
 	/* ASIX AX88178A 10/100/1000 */
-	USB_DEVICE_AND_INTERFACE_INFO(0x0b95, 0x178a, 0xff, 0xff, 0),
+	USB_DEVICE(0x0b95, 0x178a),
 	.driver_info = (unsigned long)&ax88178a_info,
 }, {
 	/* Cypress GX3 SuperSpeed to Gigabit Ethernet Bridge Controller */
-	USB_DEVICE_AND_INTERFACE_INFO(0x04b4, 0x3610, 0xff, 0xff, 0),
+	USB_DEVICE(0x04b4, 0x3610),
 	.driver_info = (unsigned long)&cypress_GX3_info,
 }, {
 	/* D-Link DUB-1312 USB 3.0 to Gigabit Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x2001, 0x4a00, 0xff, 0xff, 0),
+	USB_DEVICE(0x2001, 0x4a00),
 	.driver_info = (unsigned long)&dlink_dub1312_info,
 }, {
 	/* Sitecom USB 3.0 to Gigabit Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x0df6, 0x0072, 0xff, 0xff, 0),
+	USB_DEVICE(0x0df6, 0x0072),
 	.driver_info = (unsigned long)&sitecom_info,
 }, {
 	/* Samsung USB Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x04e8, 0xa100, 0xff, 0xff, 0),
+	USB_DEVICE(0x04e8, 0xa100),
 	.driver_info = (unsigned long)&samsung_info,
 }, {
 	/* Lenovo OneLinkDock Gigabit LAN */
-	USB_DEVICE_AND_INTERFACE_INFO(0x17ef, 0x304b, 0xff, 0xff, 0),
+	USB_DEVICE(0x17ef, 0x304b),
 	.driver_info = (unsigned long)&lenovo_info,
 }, {
 	/* Belkin B2B128 USB 3.0 Hub + Gigabit Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x050d, 0x0128, 0xff, 0xff, 0),
+	USB_DEVICE(0x050d, 0x0128),
 	.driver_info = (unsigned long)&belkin_info,
 }, {
 	/* Toshiba USB 3.0 GBit Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x0930, 0x0a13, 0xff, 0xff, 0),
+	USB_DEVICE(0x0930, 0x0a13),
 	.driver_info = (unsigned long)&toshiba_info,
 }, {
 	/* Magic Control Technology U3-A9003 USB 3.0 Gigabit Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x0711, 0x0179, 0xff, 0xff, 0),
+	USB_DEVICE(0x0711, 0x0179),
 	.driver_info = (unsigned long)&mct_info,
 }, {
 	/* Allied Telesis AT-UMC2000 USB 3.0/USB 3.1 Gen 1 to Gigabit Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x07c9, 0x000e, 0xff, 0xff, 0),
+	USB_DEVICE(0x07c9, 0x000e),
 	.driver_info = (unsigned long)&at_umc2000_info,
 }, {
 	/* Allied Telesis AT-UMC200 USB 3.0/USB 3.1 Gen 1 to Fast Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x07c9, 0x000f, 0xff, 0xff, 0),
+	USB_DEVICE(0x07c9, 0x000f),
 	.driver_info = (unsigned long)&at_umc200_info,
 }, {
 	/* Allied Telesis AT-UMC2000/SP USB 3.0/USB 3.1 Gen 1 to Gigabit Ethernet Adapter */
-	USB_DEVICE_AND_INTERFACE_INFO(0x07c9, 0x0010, 0xff, 0xff, 0),
+	USB_DEVICE(0x07c9, 0x0010),
 	.driver_info = (unsigned long)&at_umc2000sp_info,
 },
 	{ },

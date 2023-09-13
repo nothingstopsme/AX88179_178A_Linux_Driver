@@ -1489,8 +1489,12 @@ static int ax88179_check_ether_addr(struct usbnet *dev)
 		*(tmp + 2) = 0xC6;
 		*(tmp + 3) = 0x8E;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 		eth_hw_addr_set(dev->net, tmp);
+#else
+		memcpy(dev->net->dev_addr, tmp, ETH_ALEN);
+#endif
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)
